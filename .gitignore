@@ -1,0 +1,26 @@
+# 虚拟环境（几百兆，千万别传）
+venv/
+.venv/
+env/
+
+# 向量数据库（里面存了你解析后的文档向量）
+chroma_db/
+
+# 本地缓存的大模型文件（几百MB到几个G）
+model_cache/
+
+# Python 运行时缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 本地 IDE 配置（别人的电脑跟你的设置不一样）
+.idea/
+.vscode/
+*.suo
+*.user
+
+# 系统隐藏文件
+.DS_Store
+Thumbs.db

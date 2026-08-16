@@ -1,0 +1,6 @@
+为什么选 ChromaDB 而不是 FAISS？ → 因为需要持久化和易用性，Chroma 支持本地文件存储，无需额外数据库。
+
+为什么用 SentenceTransformer 而不是 Ollama 自己的 embedding？ → 因为 all-MiniLM 轻量且对中文+英文混合效果不错，Ollama 的 nomic-embed-text 模型更大，但当前项目需要快速响应。
+
+如何处理并发请求？ → FastAPI 本身异步，但 ChromaDB 查询是同步阻塞，可考虑用 asyncio.to_thread 包装，或使用独立的 worker 进程。
+

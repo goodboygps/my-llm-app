@@ -5,43 +5,75 @@ import requests
 import json
 import uvicorn
 import os
+import sys
+import chromadb
+from sentence_transformers import SentenceTransformer
+
+# Windows 终端默认 GBK，打印 emoji 会报错，强制改用 UTF-8
+sys.stdout.reconfigure(encoding='utf-8')
 
 app = FastAPI()
 
+# ---------- 1. 初始化向量引擎（只加载一次）----------
+print("🔄 正在加载向量模型...")
+model_path = os.path.join(os.getcwd(), "model_cache", "all-MiniLM-L6-v2")
+embedding_model = SentenceTransformer(model_path)
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+collection = chroma_client.get_or_create_collection(name="my_knowledge")
+print("✅ 向量引擎加载完成！")
+
+# ---------- 2. ⭐ 修改点 1：辅助函数（现在同时返回距离）----------
+def retrieve_knowledge(query, top_k=1):
+    """把问题转成向量，去 ChromaDB 里找最相关的 top_k 段知识，同时返回相似度距离"""
+    query_embedding = embedding_model.encode(query).tolist()
+    # ⭐ 加上 include=["documents", "distances"] 才能拿到分数
+    results = collection.query(
+        query_embeddings=[query_embedding], 
+        n_results=top_k,
+        include=["documents", "distances"]  
+    )
+    if results['documents'] and len(results['documents'][0]) > 0:
+        doc = results['documents'][0][0]
+        # ⭐ 获取距离（L2距离，越小越相似）
+        distance = results['distances'][0][0]
+        return doc, distance
+    return None, None
+
+# ---------- 3. 流式聊天接口（⭐ 修改点 2：加了阈值拦截）----------
 class PromptRequest(BaseModel):
     prompt: str
 
-# ---------- 核心：读取本地知识库 ----------
-def load_local_knowledge():
-    file_path = "my_knowledge.txt"
-    if os.path.exists(file_path):
-        with open(file_path, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return "（暂无本地知识库）"
-
-# ---------- RAG 流式聊天（开卷考试） ----------
 @app.post("/api/stream")
 async def stream(request: PromptRequest):
     print(f"📨 用户问题: {request.prompt}")
 
-    # 1. 读取本地知识
-    knowledge = load_local_knowledge()
-    print(f"📚 知识库内容: {knowledge}")
+    # 第一步：去向量数据库里查最相关的知识，同时拿到距离
+    knowledge, distance = retrieve_knowledge(request.prompt)
+    print(f"📚 检索到的知识片段: {knowledge}")
+    print(f"📏 相似度距离 (越小越相关): {distance}")
 
-       # 2. 构造“开卷考试”提示词（极强约束版）
+    # ⭐⭐⭐ 灵魂所在：设定阈值（0.7 是经验值，你可以后续微调）
+    # 如果没找到知识，或者距离太远（>0.7），直接拒答，绝不调用大模型！
+    if knowledge is None or distance > 0.7:
+        print("🚫 触发拒答机制：知识库无相关内容")
+        async def reject_generator():
+            yield f"data: {json.dumps({'text': '📭 知识库中未找到相关内容，我无法回答这个问题。'})}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(reject_generator(), media_type="text/event-stream")
+
+    # 第二步：只有距离小于阈值（强相关），才构造提示词
     system_prompt = f"""
-你是一个严格的知识库问答助手。你必须绝对忠诚于以下【知识库】内容。
+你是一个严格的知识库问答助手。你必须只根据以下【知识库】内容回答用户的问题。
 
 【知识库】：
 {knowledge}
 
-【绝对禁令】：
-1. 如果你的问题在知识库中**找不到完全匹配或直接相关的答案**，你必须只回复这一句话：“知识库中暂无相关信息，我无法回答。”
-2. 严禁编造、推测、或使用“可能”、“也许”、“大概”等模糊词汇。
-3. 不要回答知识库以外的任何内容。
+【回答规则】：
+- 如果知识库里有相关答案，必须基于知识库回答。
+- 不要编造任何知识库以外的内容。
 
 用户的问题是：{request.prompt}
-请回答（严格遵守禁令）：
+请回答：
 """
 
     def generate():
@@ -51,14 +83,13 @@ async def stream(request: PromptRequest):
                 "model": "qwen2:0.5b",
                 "prompt": system_prompt,
                 "stream": True,
-                "options": {          # 加上这个 options 块
-                    "temperature": 0,  # 温度归零，绝对确定性
-                    "seed": 42         # 固定随机种子，确保每次结果一样
+                "options": {
+                    "temperature": 0,
+                    "seed": 42
                 }
             },
             stream=True
         )
-
         for line in resp.iter_lines():
             if line:
                 data = json.loads(line)
@@ -70,7 +101,7 @@ async def stream(request: PromptRequest):
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
-# ---------- 图片上传（可选，保持不变） ----------
+# ---------- 4. 图片上传（保持不变）----------
 @app.post("/api/upload-image")
 async def upload_image(file: UploadFile = File(...)):
     content = await file.read()
@@ -82,22 +113,22 @@ async def upload_image(file: UploadFile = File(...)):
     )
     return {"description": json.loads(resp.text)['response']}
 
-# ---------- 前端界面（和昨天一样，不赘述） ----------
+# ---------- 5. 前端（沿用之前的界面）----------
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
     <!DOCTYPE html>
     <html>
-    <head><meta charset="UTF-8"><title>RAG · 知识库问答</title></head>
+    <head><meta charset="UTF-8"><title>向量检索 · RAG 问答</title></head>
     <body style="font-family:sans-serif;max-width:700px;margin:40px auto;padding:20px;">
-        <h2>📚 RAG 知识库问答（开卷考试）</h2>
+        <h2>🧠 向量检索版 RAG（开卷考试）</h2>
         <div style="border:1px dashed #aaa;padding:15px;border-radius:12px;margin-bottom:15px;background:#f0f8ff;">
-            <span>📄 当前知识库：<code>my_knowledge.txt</code></span>
-            <button onclick="location.reload()" style="margin-left:15px;background:#6c757d;color:white;border:none;padding:5px 15px;border-radius:15px;">刷新知识</button>
+            <span>📄 知识库已向量化（ChromaDB）</span>
+            <span style="margin-left:20px;font-size:14px;color:#28a745;">● 已就绪</span>
         </div>
         <div id="box" style="border:1px solid #ccc;height:350px;overflow-y:auto;padding:10px;background:#f5f5f5;border-radius:8px;"></div>
         <div style="display:flex;margin-top:10px;">
-            <input id="input" type="text" style="flex:1;padding:10px;border-radius:25px;border:1px solid #ccc;" placeholder="问一个知识库里有答案的问题..." />
+            <input id="input" type="text" style="flex:1;padding:10px;border-radius:25px;border:1px solid #ccc;" placeholder="问知识库里的内容..." />
             <button id="btn" style="padding:10px 20px;margin-left:10px;border-radius:25px;border:none;background:#007bff;color:white;">发送</button>
         </div>
         <script>
