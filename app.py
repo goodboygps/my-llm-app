@@ -4,23 +4,61 @@ from pydantic import BaseModel
 import requests
 import json
 import uvicorn
+import os
 
 app = FastAPI()
 
 class PromptRequest(BaseModel):
     prompt: str
 
-# ---------- 1. 流式聊天 ----------
+# ---------- 核心：读取本地知识库 ----------
+def load_local_knowledge():
+    file_path = "my_knowledge.txt"
+    if os.path.exists(file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    return "（暂无本地知识库）"
+
+# ---------- RAG 流式聊天（开卷考试） ----------
 @app.post("/api/stream")
 async def stream(request: PromptRequest):
-    print(f"📨 收到: {request.prompt}")
+    print(f"📨 用户问题: {request.prompt}")
+
+    # 1. 读取本地知识
+    knowledge = load_local_knowledge()
+    print(f"📚 知识库内容: {knowledge}")
+
+       # 2. 构造“开卷考试”提示词（极强约束版）
+    system_prompt = f"""
+你是一个严格的知识库问答助手。你必须绝对忠诚于以下【知识库】内容。
+
+【知识库】：
+{knowledge}
+
+【绝对禁令】：
+1. 如果你的问题在知识库中**找不到完全匹配或直接相关的答案**，你必须只回复这一句话：“知识库中暂无相关信息，我无法回答。”
+2. 严禁编造、推测、或使用“可能”、“也许”、“大概”等模糊词汇。
+3. 不要回答知识库以外的任何内容。
+
+用户的问题是：{request.prompt}
+请回答（严格遵守禁令）：
+"""
 
     def generate():
         resp = requests.post(
             "http://localhost:11434/api/generate",
-            json={"model": "qwen2:0.5b", "prompt": request.prompt, "stream": True},
+            json={
+                "model": "qwen2:0.5b",
+                "prompt": system_prompt,
+                "stream": True,
+                "options": {          # 加上这个 options 块
+                    "temperature": 0,  # 温度归零，绝对确定性
+                    "seed": 42         # 固定随机种子，确保每次结果一样
+                }
+            },
             stream=True
         )
+
         for line in resp.iter_lines():
             if line:
                 data = json.loads(line)
@@ -32,7 +70,7 @@ async def stream(request: PromptRequest):
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
-# ---------- 2. 图片上传解说（盲猜版）----------
+# ---------- 图片上传（可选，保持不变） ----------
 @app.post("/api/upload-image")
 async def upload_image(file: UploadFile = File(...)):
     content = await file.read()
@@ -44,24 +82,22 @@ async def upload_image(file: UploadFile = File(...)):
     )
     return {"description": json.loads(resp.text)['response']}
 
-# ---------- 3. 前端页面（完整版）----------
+# ---------- 前端界面（和昨天一样，不赘述） ----------
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
     <!DOCTYPE html>
     <html>
-    <head><meta charset="UTF-8"><title>完整版 · 打字机 + 图片</title></head>
+    <head><meta charset="UTF-8"><title>RAG · 知识库问答</title></head>
     <body style="font-family:sans-serif;max-width:700px;margin:40px auto;padding:20px;">
-        <h2>🚀 完整版（打字机 + 图片解说）</h2>
-        <div style="border:1px dashed #aaa;padding:15px;border-radius:12px;margin-bottom:15px;">
-            <input type="file" id="fileInput" accept="image/*" style="display:none;" />
-            <button onclick="document.getElementById('fileInput').click()">📷 选图</button>
-            <span id="fileName" style="margin-left:15px;color:#888;">未选择</span>
-            <button onclick="uploadImage()" style="margin-left:10px;background:#28a745;color:white;border:none;padding:8px 20px;border-radius:20px;">上传解说</button>
+        <h2>📚 RAG 知识库问答（开卷考试）</h2>
+        <div style="border:1px dashed #aaa;padding:15px;border-radius:12px;margin-bottom:15px;background:#f0f8ff;">
+            <span>📄 当前知识库：<code>my_knowledge.txt</code></span>
+            <button onclick="location.reload()" style="margin-left:15px;background:#6c757d;color:white;border:none;padding:5px 15px;border-radius:15px;">刷新知识</button>
         </div>
         <div id="box" style="border:1px solid #ccc;height:350px;overflow-y:auto;padding:10px;background:#f5f5f5;border-radius:8px;"></div>
         <div style="display:flex;margin-top:10px;">
-            <input id="input" type="text" style="flex:1;padding:10px;border-radius:25px;border:1px solid #ccc;" placeholder="问点什么..." />
+            <input id="input" type="text" style="flex:1;padding:10px;border-radius:25px;border:1px solid #ccc;" placeholder="问一个知识库里有答案的问题..." />
             <button id="btn" style="padding:10px 20px;margin-left:10px;border-radius:25px;border:none;background:#007bff;color:white;">发送</button>
         </div>
         <script>
@@ -148,28 +184,6 @@ def home():
 
             btn.onclick = send;
             input.onkeydown = (e) => { if (e.key === 'Enter') send(); };
-
-            // 图片上传
-            document.getElementById('fileInput').onchange = function(e) {
-                document.getElementById('fileName').textContent = this.files[0]?.name || '未选择';
-            };
-            async function uploadImage() {
-                const fileInput = document.getElementById('fileInput');
-                if (!fileInput.files.length) return alert('请先选择一张图片');
-                const formData = new FormData();
-                formData.append('file', fileInput.files[0]);
-                addMsg('📤 正在上传图片...', false);
-                try {
-                    const res = await fetch('/api/upload-image', { method: 'POST', body: formData });
-                    const data = await res.json();
-                    addMsg('🖼️ ' + data.description, false);
-                } catch(e) {
-                    addMsg('❌ 上传失败', false);
-                }
-                fileInput.value = '';
-                document.getElementById('fileName').textContent = '未选择';
-            }
-            window.uploadImage = uploadImage;
         </script>
     </body>
     </html>
