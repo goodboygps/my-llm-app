@@ -2,6 +2,7 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 import requests
+import uuid
 import json
 import uvicorn
 import os
@@ -20,6 +21,7 @@ model_path = os.path.join(os.getcwd(), "model_cache", "all-MiniLM-L6-v2")
 embedding_model = SentenceTransformer(model_path)
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 collection = chroma_client.get_or_create_collection(name="my_knowledge")
+sessions = {}
 print("✅ 向量引擎加载完成！")
 
 # ---------- 2. ⭐ 修改点 1：辅助函数（现在同时返回距离）----------
@@ -42,51 +44,81 @@ def retrieve_knowledge(query, top_k=1):
 # ---------- 3. 流式聊天接口（⭐ 修改点 2：加了阈值拦截）----------
 class PromptRequest(BaseModel):
     prompt: str
+    session_id: str | None = None
 
 @app.post("/api/stream")
 async def stream(request: PromptRequest):
     print(f"📨 用户问题: {request.prompt}")
-
-    # 第一步：去向量数据库里查最相关的知识，同时拿到距离
     knowledge, distance = retrieve_knowledge(request.prompt)
-    print(f"📚 检索到的知识片段: {knowledge}")
-    print(f"📏 相似度距离 (越小越相关): {distance}")
+    print(f"📚 检索到的知识: {knowledge}")   # 看有没有内容
+    print(f"📏 距离: {distance}")            # 看数值是多少
 
-    # ⭐⭐⭐ 灵魂所在：设定阈值（0.7 是经验值，你可以后续微调）
-    # 如果没找到知识，或者距离太远（>0.7），直接拒答，绝不调用大模型！
-    if knowledge is None or distance > 0.7:
-        print("🚫 触发拒答机制：知识库无相关内容")
+    # ---- 1. 会话管理（记忆逻辑） ----
+    # 如果前端没传session_id，就自动生成一个
+    if not request.session_id:
+        session_id = str(uuid.uuid4())
+    else:
+        session_id = request.session_id
+
+    # 如果是新用户，在字典里初始化一个空列表
+    if session_id not in sessions:
+        sessions[session_id] = []
+
+    # 获取当前会话的历史记录（最多保留最近 6 条，防溢出）
+    history = sessions[session_id][-6:]
+
+    # ---- 2. 向量检索 + 拒答阈值 ----
+    knowledge, distance = retrieve_knowledge(request.prompt)
+    print(f"📚 检索知识: {knowledge}")
+    print(f"📏 距离分数: {distance}")
+
+    # 如果知识库没命中或距离太远，直接拒答（并清空这一轮的记忆，防止污染）
+    if knowledge is None or distance > 1.4:
+        print("🚫 触发拒答机制")
         async def reject_generator():
-            yield f"data: {json.dumps({'text': '📭 知识库中未找到相关内容，我无法回答这个问题。'})}\n\n"
+            yield f"data: {json.dumps({'text': '📭 知识库中未找到相关内容，我无法回答。'})}\n\n"
             yield "data: [DONE]\n\n"
         return StreamingResponse(reject_generator(), media_type="text/event-stream")
 
-    # 第二步：只有距离小于阈值（强相关），才构造提示词
+    # ---- 3. 构造包含“历史记录”的提示词 ----
+    # 格式化历史对话
+    history_text = ""
+    for msg in history:
+        role = "用户" if msg["role"] == "user" else "助手"
+        history_text += f"{role}: {msg['content']}\n"
+
     system_prompt = f"""
 你是一个严格的知识库问答助手。你必须只根据以下【知识库】内容回答用户的问题。
 
 【知识库】：
 {knowledge}
 
+【对话历史】（供参考上下文）：
+{history_text}
+
 【回答规则】：
 - 如果知识库里有相关答案，必须基于知识库回答。
 - 不要编造任何知识库以外的内容。
+- 如果用户的问题在历史中已经提过，结合历史上下文给出连贯回答。
 
 用户的问题是：{request.prompt}
 请回答：
 """
 
-    def generate():
+    # ---- 4. 流式生成（并记录到记忆中） ----
+    # 先把用户问题记入“笔记本”
+    sessions[session_id].append({"role": "user", "content": request.prompt})
+
+    # 定义生成器
+    async def generate():
+        full_response = ""
         resp = requests.post(
             "http://localhost:11434/api/generate",
             json={
                 "model": "qwen2:0.5b",
                 "prompt": system_prompt,
                 "stream": True,
-                "options": {
-                    "temperature": 0,
-                    "seed": 42
-                }
+                "options": {"temperature": 0, "seed": 42}
             },
             stream=True
         )
@@ -94,10 +126,19 @@ async def stream(request: PromptRequest):
             if line:
                 data = json.loads(line)
                 if 'response' in data:
-                    yield f"data: {json.dumps({'text': data['response']})}\n\n"
+                    chunk = data['response']
+                    full_response += chunk
+                    yield f"data: {json.dumps({'text': chunk})}\n\n"
                 if data.get('done'):
-                    yield "data: [DONE]\n\n"
                     break
+
+        # 把 AI 的回答也记入“笔记本”
+        sessions[session_id].append({"role": "assistant", "content": full_response})
+        # 限制只保留最近 10 条，防止内存泄露
+        if len(sessions[session_id]) > 10:
+            sessions[session_id] = sessions[session_id][-10:]
+
+        yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -135,6 +176,12 @@ def home():
             const box = document.getElementById('box');
             const input = document.getElementById('input');
             const btn = document.getElementById('btn');
+            // 生成或读取会话ID（存储在浏览器里，关掉网页也不会丢）
+            let sessionId = localStorage.getItem('chat_session_id');
+            if (!sessionId) {
+                sessionId = crypto.randomUUID();  // 生成一个全球唯一的ID
+                localStorage.setItem('chat_session_id', sessionId);
+            }
 
             function addMsg(text, isUser) {
                 const d = document.createElement('div');
@@ -179,7 +226,7 @@ def home():
                     const res = await fetch('/api/stream', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({prompt: msg})
+                        body: JSON.stringify({prompt: msg, session_id: sessionId})
                     });
                     const reader = res.body.getReader();
                     const decoder = new TextDecoder();
